@@ -2,6 +2,33 @@
 
 A high-performance distributed rate limiting service with priority-based scheduling, built using FastAPI, Redis simulation, and AsyncIO.
 
+## Project Structure
+
+```
+.
+├── main.py                  # FastAPI application and API endpoints
+├── algorithms/
+│   ├── sliding_window.py    # Sliding window counter (rate limiting)
+│   ├── token_bucket.py      # Token bucket (burst control)
+│   └── priority_heap.py     # Binary min-heap (priority queue scheduler)
+├── storage/
+│   └── redis_simulator.py   # Async Redis simulator with latency and atomicity
+├── tests/
+│   ├── conftest.py          # Shared fixtures and state cleanup
+│   ├── test_burst_traffic.py
+│   ├── test_multi_tenant.py
+│   ├── test_priority_inversion.py
+│   ├── test_sliding_window_precision.py
+│   ├── test_heap_unit.py
+│   ├── test_concurrency.py
+│   └── test_distributed_nodes.py
+├── benchmark.py             # Performance measurement (throughput, latency, memory)
+├── redis_utils.py           # Redis helper utilities
+├── run.py                   # Uvicorn launcher
+├── requirements.txt
+└── README.md
+```
+
 ## Architecture & Design
 
 ### System Overview
@@ -81,14 +108,20 @@ consumed = max(0, stored_consumed - (elapsed_time * refill_rate))
 
 **How it works:** When a request is rejected by the rate limiter, it's inserted into a per-tenant priority heap. Lower numerical priority = processed first. Items with equal priority are ordered by insertion sequence (FIFO).
 
+**Key operations:**
+- `insert(item, priority)` — Add an item while maintaining heap invariants. O(log n).
+- `extract_min()` — Retrieve the highest-priority item. O(log n).
+- `decrease_key(index, new_priority)` — Boost an item's priority (lower value = higher priority). Used by the aging mechanism to prevent starvation. O(log n).
+- `apply_aging()` — Scans the heap and calls `decrease_key` on items waiting longer than 5 seconds, promoting NORMAL→HIGH→CRITICAL.
+
 **Trade-offs:**
-- **O(log n) insert and extract** — Standard heap operations.
-- **`decrease_key` for aging** — Items waiting longer than 5 seconds get their priority boosted (e.g., NORMAL→HIGH→CRITICAL) to prevent starvation. Uses `decrease_key` which is O(log n) per item.
+- **O(log n) core operations** — Standard heap guarantees for insert, extract, and decrease_key.
+- **FIFO within same priority** — Sequence numbers break ties so equal-priority items are processed in insertion order.
 - **In-memory, not distributed** — The priority queue is per-node, not shared via Redis. In a real system, you'd use a distributed priority queue (e.g., Redis sorted sets) or route queued items consistently to the same node. We chose in-memory for latency.
 
 ### Distributed Consistency
 
-**Approach:** All rate-limiting state (window counters, token bucket state) is stored in the shared Redis simulator. Multiple API nodes connect to the same Redis instance.
+**Approach:** All rate-limiting state (window counters, token bucket state) is stored in the shared Redis simulator. Multiple API nodes connect to the same Redis instance. This is demonstrated in `tests/test_distributed_nodes.py`, which creates 3 independent FastAPI app instances sharing a single `RedisSimulator` and verifies that the global rate limit is enforced across all nodes.
 
 **Atomic operations:** Each Redis operation (get, set, incr, decr) is individually atomic (protected by asyncio.Lock in the simulator). Application-level locks per rate-limit key ensure that read-check-write sequences are atomic across concurrent requests within a node. Cross-node atomicity is provided by Redis's single-threaded model (simulated by the global lock).
 
@@ -155,6 +188,44 @@ Once the service is running, visit:
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
 
+### API Specification
+
+#### `POST /v1/rate-limit/check` — Rate Check
+
+Validates if a request should proceed or be queued.
+
+| Field | Type | Description |
+|---|---|---|
+| **Request** | | |
+| `client_id` | string | Client identifier |
+| `tenant_id` | string | Tenant identifier |
+| `priority` | int | 0 = CRITICAL, 1 = HIGH, 2 = NORMAL (default) |
+| **Response** | | |
+| `allowed` | bool | Whether the request is permitted |
+| `retry_after` | float/null | Seconds to wait before retrying (if rejected) |
+| `queued` | bool | Whether the request was added to the priority queue |
+
+#### `GET /v1/queue/status?tenant_id={id}` — Queue Status
+
+Returns the current depth and processing state of the tenant's priority queue.
+
+| Field | Type | Description |
+|---|---|---|
+| `tenant_id` | string | Tenant identifier |
+| `queue_depth` | int | Number of items waiting in the queue |
+| `processing` | bool | Whether a background processor is active |
+
+#### `PUT /v1/tenant/config` — Tenant Configuration
+
+Dynamically updates rate limits and burst settings. Resets existing limiters for the tenant.
+
+| Field | Type | Description |
+|---|---|---|
+| `tenant_id` | string | Tenant identifier |
+| `rate_limit` | int | Max requests per second (sliding window) |
+| `burst_capacity` | int | Max burst size (token bucket capacity) |
+| `refill_rate` | int | Tokens refilled per second |
+
 ### Example API Usage
 
 Configure a tenant:
@@ -213,10 +284,16 @@ pytest tests/test_distributed_nodes.py -v      # Multi-node distributed tests
 python benchmark.py
 ```
 
-Measures:
+Runs three benchmark scenarios:
+1. **Throughput test** — 10,000 requests with 100 concurrency. Measures sustained req/s.
+2. **Burst test** — 500 concurrent requests against a 100 req/s limit. Measures rejection behavior under load.
+3. **Priority test** — 50 normal + 10 critical requests against a 10 req/s limit. Measures queue depth and priority handling.
+
+Reports:
 - Throughput (requests/second) — target: >10,000 req/s
 - Latency (p50, p95, p99) — target: p95 < 5ms
-- Memory footprint — peak memory during benchmark
+- Peak memory usage (via `tracemalloc`)
+- PASS/FAIL summary against targets
 
 ### Test Coverage
 
